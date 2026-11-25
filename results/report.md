@@ -32,30 +32,29 @@
 
 ## 3. Headline comparison (test set, record-level)
 
-| metric | RNN | LSTM | RandomForest (baseline) |
-|---|---|---|---|
-| accuracy | 0.9630 | 0.9568 | 0.9753 |
-| balanced_accuracy | 0.9693 | 0.9579 | 0.9693 |
-| macro_f1 | 0.9557 | 0.9495 | 0.9696 |
-| weighted_f1 | 0.9634 | 0.9569 | 0.9752 |
-| macro_precision | 0.9444 | 0.9422 | 0.9703 |
-| macro_recall | 0.9693 | 0.9579 | 0.9693 |
-| cohen_kappa | 0.9392 | 0.9287 | 0.9588 |
-| mcc | 0.9404 | 0.9295 | 0.9590 |
-| log_loss | 0.1710 | 0.1897 | 0.1486 |
-| top3_accuracy | - | - | - |
-| roc_auc_macro_ovr | 0.9870 | 0.9861 | 0.9952 |
-| accuracy 95% CI | [0.932, 0.988] | [0.920, 0.988] | [0.951, 0.994] |
-| macro-F1 95% CI | [0.918, 0.987] | [0.906, 0.982] | [0.936, 0.995] |
+| metric | RNN | RandomForest (baseline) |
+|---|---|---|
+| accuracy | 0.9630 | 0.9753 |
+| balanced_accuracy | 0.9693 | 0.9693 |
+| macro_f1 | 0.9557 | 0.9696 |
+| weighted_f1 | 0.9634 | 0.9752 |
+| macro_precision | 0.9444 | 0.9703 |
+| macro_recall | 0.9693 | 0.9693 |
+| cohen_kappa | 0.9392 | 0.9588 |
+| mcc | 0.9404 | 0.9590 |
+| log_loss | 0.1710 | 0.1486 |
+| top3_accuracy | - | - |
+| roc_auc_macro_ovr | 0.9870 | 0.9952 |
+| accuracy 95% CI | [0.932, 0.988] | [0.951, 0.994] |
+| macro-F1 95% CI | [0.918, 0.987] | [0.936, 0.995] |
 
 
 ## 4. Training summary
 
 | model | params | epochs run | best epoch | train time (s) | chunk-level test acc | chunk-level test macro-F1 |
 |---|---|---|---|---|---|---|
-| RNN | 24387 | 34 | 22 | 342.4 | 0.9509 | 0.9411 |
-| LSTM | 72195 | 26 | 14 | 289.9 | 0.9453 | 0.9356 |
-| RandomForest (baseline) | - | - | - | 5.6 | nan | nan |
+| RNN | 24387 | 34 | 22 | 204.1 | 0.9509 | 0.9411 |
+| RandomForest (baseline) | - | - | - | 3.7 | nan | nan |
 
 
 ![curves](curves.png)
@@ -80,28 +79,6 @@ Most frequent confusions (true -> predicted, count):
 
 
 ![cm](cm_RNN.png)
-
-
-## 5. Detail: LSTM
-
-| class | precision | recall | f1 | support | AUC (OvR) |
-|---|---|---|---|---|---|
-| I | 0.9000 | 0.9310 | 0.9153 | 29 | 0.9712 |
-| NL | 0.9880 | 0.9425 | 0.9647 | 87 | 0.9911 |
-| R | 0.9388 | 1.0000 | 0.9684 | 46 | 0.9959 |
-
-
-Most frequent confusions (true -> predicted, count):
-
-| true | predicted | count |
-|---|---|---|
-| NL | I | 3 |
-| NL | R | 2 |
-| I | NL | 1 |
-| I | R | 1 |
-
-
-![cm](cm_LSTM.png)
 
 
 ## 5. Detail: RandomForest (baseline)
@@ -133,3 +110,26 @@ Most frequent confusions (true -> predicted, count):
 - If the test set is small the CIs above are wide; differences between models inside the CI are not significant.
 - The RandomForest row uses per-record mean/std/min/max of the same features; if the RNN/LSTM does not beat it, the temporal structure is not adding much.
 - PLAID has several records per physical appliance; a split by id can still put the same appliance in train and test, so real-world generalisation may be lower.
+
+## 7. SHAP feature attribution (GradientExplainer)
+SHAP values are in logit units, computed on standardised features. Importance = |sum of SHAP over the sequence's time steps| averaged over explained test chunks and classes. Plots and full tables are in `shap_<model>/`.
+
+### RNN (additivity error 1.5319 logits)
+| rank | feature | mean |SHAP| |
+|---|---|---|
+| 1 | i_h3_ratio | 0.3951 |
+| 2 | sin_phi | 0.3287 |
+| 3 | phase_deg | 0.2878 |
+| 4 | i_h5_ratio | 0.2361 |
+| 5 | i_harm_phase_h3_deg | 0.2187 |
+| 6 | p_inst_min | 0.2116 |
+| 7 | v_thd | 0.1583 |
+| 8 | v_mean | 0.1519 |
+| 9 | v_crest_factor | 0.1398 |
+| 10 | i_odd_even_ratio | 0.1329 |
+
+![global](shap_rnn/global_importance.png)
+
+![heatmap](shap_rnn/class_feature_heatmap.png)
+
+![temporal](shap_rnn/temporal_importance.png)

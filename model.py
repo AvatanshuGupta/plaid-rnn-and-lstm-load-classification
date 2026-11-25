@@ -21,6 +21,7 @@ Outputs (in --out_dir)
   report.md / report.json         full performance report
   curves.png, cm_<model>.png, per_class_f1.png
   <model>.pt                      weights + preprocessing + class names
+  shap_<model>/                   SHAP plots + importance CSVs (with --shap)
   predictions_<model>.csv         per-record test predictions
 """
 import argparse
@@ -44,6 +45,9 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
                              matthews_corrcoef, precision_score, recall_score,
                              roc_auc_score)
 from sklearn.model_selection import train_test_split
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="shap")
+warnings.filterwarnings("ignore", message=".*NumPy global RNG.*")
 
 NON_FEATURE = {"id", "window_idx", "start_sample", "end_sample", "t_start_s",
                "t_end_s", "appliance_type", "load", "status", "location"}
@@ -368,6 +372,86 @@ def write_report(path, info, results, run_info, split_info, class_names):
     open(path, "w").write("\n".join(L))
 
 
+
+# =============================================================================
+# SHAP explainability
+# =============================================================================
+def run_shap(model, cell, Xtr, Xte, feat_names, class_names, out_dir, device,
+             n_bg=100, n_explain=200, seed=0, nsamples=300):
+    """
+    GradientExplainer (expected gradients) on the trained sequence model.
+    Input to the model is (B, T, F), so SHAP values come out as (B, T, F, C):
+    one value per sample, time step, feature and output class (logit).
+    """
+    import shap
+    rng = np.random.default_rng(seed)
+    bg = Xtr[rng.choice(len(Xtr), min(n_bg, len(Xtr)), replace=False)]
+    idx = rng.choice(len(Xte), min(n_explain, len(Xte)), replace=False)
+    Xex = Xte[idx]
+    model = model.to(device).eval()
+    bg_t = torch.from_numpy(bg).to(device)
+    ex_t = torch.from_numpy(Xex).to(device)
+
+    # cuDNN RNN kernels refuse backward() in eval mode -> disable cuDNN for this call
+    with torch.backends.cudnn.flags(enabled=False):
+        sv = shap.GradientExplainer(model, bg_t).shap_values(ex_t, nsamples=nsamples)
+        with torch.no_grad():
+            f_ex, f_bg = model(ex_t).cpu().numpy(), model(bg_t).cpu().numpy()
+    sv = np.stack(sv, -1) if isinstance(sv, list) else np.asarray(sv)   # (B,T,F,C)
+
+    # sanity check: SHAP values should sum to f(x) - E[f(background)] per class
+    gap = np.abs(sv.sum((1, 2)) - (f_ex - f_bg.mean(0))).mean()
+    print(f"  [shap] additivity error (mean |sum(SHAP) - (f(x)-E[f])|): {gap:.4f} logits")
+
+    d = os.path.join(out_dir, f"shap_{cell}")
+    os.makedirs(d, exist_ok=True)
+    A = np.abs(sv)
+    imp_fc = np.abs(sv.sum(1)).mean(0)               # (F, C): |total contribution over the sequence|, averaged over samples
+    imp = pd.DataFrame(imp_fc, index=feat_names, columns=class_names)
+    imp.insert(0, "overall", imp_fc.mean(1))
+    imp = imp.sort_values("overall", ascending=False)
+    imp.to_csv(os.path.join(d, "feature_importance.csv"))
+    imp_t = A.sum(2).mean((0, 2))                    # (T,) total |attribution| per time step (all features)
+    pd.DataFrame({"time_step": range(len(imp_t)), "mean_abs_shap": imp_t}
+                 ).to_csv(os.path.join(d, "temporal_importance.csv"), index=False)
+
+    # 1) global bar chart
+    top = imp.head(20)[::-1]
+    plt.figure(figsize=(7, 6)); plt.barh(top.index, top["overall"])
+    plt.xlabel("mean |total SHAP| per sequence (logit units, averaged over classes)")
+    plt.title(f"{cell.upper()}: global feature importance"); plt.tight_layout()
+    plt.savefig(os.path.join(d, "global_importance.png"), dpi=130); plt.close()
+
+    # 2) class x feature heat-map
+    top = imp.head(15)
+    fig, ax = plt.subplots(figsize=(max(7, .8 * len(class_names) + 3), 6))
+    im = ax.imshow(top[class_names].to_numpy(), aspect="auto", cmap="viridis")
+    ax.set_xticks(range(len(class_names))); ax.set_xticklabels(class_names, rotation=60, ha="right")
+    ax.set_yticks(range(len(top))); ax.set_yticklabels(top.index)
+    ax.set_title(f"{cell.upper()}: mean |SHAP| per class"); plt.colorbar(im)
+    plt.tight_layout(); plt.savefig(os.path.join(d, "class_feature_heatmap.png"), dpi=130); plt.close()
+
+    # 3) which part of the sequence matters
+    plt.figure(figsize=(7, 3.5)); plt.plot(imp_t, marker="o")
+    plt.xlabel("time step inside the sequence (window index)"); plt.ylabel("sum over features of mean |SHAP|")
+    plt.title(f"{cell.upper()}: temporal importance"); plt.grid(alpha=.3); plt.tight_layout()
+    plt.savefig(os.path.join(d, "temporal_importance.png"), dpi=130); plt.close()
+
+    # 4) beeswarm per class. SHAP is additive, so summing over time gives each
+    #    feature's total contribution; the colour is the feature's mean value over the sequence.
+    feat_val = Xex.mean(1)
+    for c, cname in enumerate(class_names):
+        try:
+            shap.summary_plot(sv[..., c].sum(1), feat_val, feature_names=feat_names,
+                              max_display=15, show=False)
+            plt.title(f"{cell.upper()} - class: {cname}"); plt.tight_layout()
+            plt.savefig(os.path.join(d, f"beeswarm_{cname}.png".replace("/", "_")), dpi=120)
+        except Exception as e:                             # plotting must never kill the run
+            print(f"  [shap] beeswarm for {cname} skipped: {e}")
+        plt.close("all")
+    return imp, float(gap), d
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -393,6 +477,11 @@ def main():
     p.add_argument("--min_per_class", type=int, default=6)
     p.add_argument("--drop_cols", nargs="*", default=["f0_Hz"],
                    help="feature columns to exclude (f0_Hz can fingerprint a recording session)")
+    p.add_argument("--shap", action="store_true", help="run SHAP analysis on each trained model")
+    p.add_argument("--shap_models", nargs="+", default=None, help="subset of models to explain (default: all)")
+    p.add_argument("--shap_background", type=int, default=100, help="background chunks for SHAP")
+    p.add_argument("--shap_samples", type=int, default=200, help="test chunks to explain")
+    p.add_argument("--shap_nsamples", type=int, default=300, help="expected-gradient samples (higher = more accurate, slower)")
     p.add_argument("--no_baseline", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     a = p.parse_args()
@@ -438,7 +527,7 @@ def main():
     cnt = np.bincount(ytr, minlength=n_cls).astype(float)
     class_w = np.where(cnt > 0, cnt.sum() / (n_cls * np.maximum(cnt, 1)), 0.0)
 
-    results, hists, run_info = {}, {}, {}
+    results, hists, run_info, shap_res = {}, {}, {}, {}
     for cell in a.models:
         print(f"\n=== training {cell.upper()} ===")
         model, hist, ri = train_one(cell, a, Xtr, ytr, Xva, yva, rva, n_cls, device, class_w)
@@ -460,6 +549,11 @@ def main():
                             ("keep", "median", "lo", "hi", "mean", "std")}},
                    os.path.join(a.out_dir, f"{cell}.pt"))
         print(f"  test (record-level): acc {m['accuracy']:.4f}  macro-F1 {m['macro_f1']:.4f}")
+        if a.shap and (a.shap_models is None or cell in a.shap_models):
+            print(f"  running SHAP for {cell.upper()} ...")
+            shap_res[cell.upper()] = run_shap(model, cell, Xtr, Xte, used_feats, class_names,
+                                              a.out_dir, device, a.shap_background,
+                                              a.shap_samples, a.seed, a.shap_nsamples)
 
     if not a.no_baseline:
         print("\n=== RandomForest baseline (per-record aggregate features) ===")
@@ -498,6 +592,20 @@ def main():
             "early stopping": f"val loss, patience {a.patience}", "seed": a.seed,
             "device": device}
     write_report(os.path.join(a.out_dir, "report.md"), info, results, run_info, split_info, class_names)
+    if shap_res:
+        with open(os.path.join(a.out_dir, "report.md"), "a") as fh:
+            fh.write("\n## 7. SHAP feature attribution (GradientExplainer)\n")
+            fh.write("SHAP values are in logit units, computed on standardised features. "
+                     "Importance = |sum of SHAP over the sequence's time steps| averaged over explained test chunks and classes. "
+                     "Plots and full tables are in `shap_<model>/`.\n")
+            for mname, (imp, gap, d) in shap_res.items():
+                fh.write(f"\n### {mname} (additivity error {gap:.4f} logits)\n")
+                fh.write(md_table(["rank", "feature", "mean |SHAP|"],
+                                  [(k + 1, n, f"{v:.4f}") for k, (n, v) in
+                                   enumerate(imp["overall"].head(10).items())]))
+                fh.write(f"\n![global](shap_{mname.lower()}/global_importance.png)\n"
+                         f"\n![heatmap](shap_{mname.lower()}/class_feature_heatmap.png)\n"
+                         f"\n![temporal](shap_{mname.lower()}/temporal_importance.png)\n")
     json.dump({"info": info, "split": split_info, "run_info": run_info,
                "results": results, "history": hists},
               open(os.path.join(a.out_dir, "report.json"), "w"), indent=2, default=float)
